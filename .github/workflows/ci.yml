@@ -1,0 +1,327 @@
+# ============================================================
+# Basic CI Pipeline (Starting Point)
+# This is a traditional CI pipeline WITHOUT agentic features.
+# Your exercise: Transform this into an agentic CI pipeline.
+# ============================================================
+name: Basic CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Build API
+        run: dotnet build src/api/TodoApi.csproj --configuration Release
+
+      - name: Run API Tests
+        run: dotnet test src/api/Tests/TodoApi.Tests.csproj
+
+      - name: Install Frontend Dependencies
+        run: cd src/frontend && npm ci
+
+      - name: Run Frontend Tests
+        run: cd src/frontend && npm test
+
+
+  # ---- Security Scanning  ----
+  #
+  # This runs on every pull request AND on every push to main, so nothing
+  # reaches Test or Production without being scanned. deploy-test needs it.
+  #
+  # CodeQL is free on public repositories and requires GitHub Code Security
+  # on private ones. lab-preparation.md creates a public repository for this
+  # reason. If you made yours private, this job is where you will find out.
+  security-scan:
+    needs: [build-and-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+
+      # CodeQL only runs on public repositories. On a private repository it
+      # needs GitHub Code Security, so the scan steps are skipped instead of
+      # failing the job (deploy depends on this job completing).
+      - name: Check repository visibility
+        id: visibility
+        run: echo "public=${{ github.event.repository.private == false }}" >> "$GITHUB_OUTPUT"
+
+      # `actions` analyses the workflow files themselves for script injection
+      # and untrusted-input issues. On a repo that hands a coding agent write
+      # access, the workflows are part of the attack surface.
+      - name: Initialize CodeQL
+        if: steps.visibility.outputs.public == 'true'
+        uses: github/codeql-action/init@v4
+        with:
+          languages: csharp, javascript, actions
+
+      - name: Build for CodeQL
+        if: steps.visibility.outputs.public == 'true'
+        run: dotnet build src/api/TodoApi.csproj
+
+      - name: Perform CodeQL Analysis
+        if: steps.visibility.outputs.public == 'true'
+        uses: github/codeql-action/analyze@v4
+
+      - name: CodeQL unavailable
+        if: steps.visibility.outputs.public != 'true'
+        run: echo "Skipping CodeQL analysis because this repository is not public."
+
+  # ---- Dependency review (merge gate) ----
+  # Compares dependency changes on every pull request and push to main, and
+  # fails when a newly introduced dependency has a high-severity vulnerability.
+  # Public repositories include dependency review; private repositories need
+  # GitHub Code Security, so unsupported repositories skip without blocking deploy.
+  dependency-review:
+    needs: [build-and-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check dependency review support
+        id: dependency-review-support
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          repo_response=$(gh api "repos/${{ github.repository }}")
+
+          is_private=$(echo "$repo_response" | jq -r '.private')
+          advanced_security_status=$(echo "$repo_response" | jq -r '.security_and_analysis.advanced_security.status // "disabled"')
+
+          # Dependency review is available on every public repository, and on
+          # private repositories only with GitHub Code Security.
+          if [ "$is_private" = "false" ] || [ "$advanced_security_status" = "enabled" ]; then
+            echo "supported=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "supported=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Dependency Review
+        if: steps.dependency-review-support.outputs.supported == 'true'
+        uses: actions/dependency-review-action@v5
+        with:
+          base-ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
+          head-ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          fail-on-severity: high
+      - name: Dependency review unavailable
+        if: steps.dependency-review-support.outputs.supported != 'true'
+        run: echo "Skipping dependency review because this is a private repository without GitHub Code Security."
+
+
+
+
+ # ---- Deploy ----
+  # `environment: production` is the approval gate. That environment carries a
+  # required-reviewer rule, so this job waits for a human before it touches
+  # Azure. See lab-preparation.md.
+  deploy:
+    needs: [build-and-test, security-scan, dependency-review]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    environment:
+      name: production
+      url: ${{ steps.infra.outputs.staticWebAppUrl }}
+    outputs:
+      api-url: ${{ steps.infra.outputs.apiAppUrl }}
+      frontend-url: ${{ steps.infra.outputs.staticWebAppUrl }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Azure Login (OIDC)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Deploy Infrastructure (Bicep)
+        id: infra
+        uses: azure/bicep-deploy@v2
+        with:
+          type: deployment
+          operation: create
+          scope: resourceGroup
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          resource-group-name: ${{ secrets.AZURE_RG }}
+          template-file: infra/main.bicep
+          parameters-file: infra/parameters.json
+          parameters: |
+            authenticationClientId: ${{ secrets.AZURE_AUTH_CLIENT_ID }}
+            sqlAdminObjectId: ${{ vars.AZURE_SQL_ADMIN_OBJECT_ID }}
+            sqlAdminLogin: ${{ vars.AZURE_SQL_ADMIN_LOGIN }}
+
+      # The API connects to SQL as its managed identity, which can only
+      # authenticate once it exists as a contained user inside the database.
+      # Azure SQL exposes no ARM surface for that, so it happens over TDS.
+      - name: Grant API managed identity access to SQL
+        env:
+          RESOURCE_GROUP: ${{ secrets.AZURE_RG }}
+          SQL_SERVER: ${{ steps.infra.outputs.sqlServerName }}
+          SQL_DATABASE: ${{ steps.infra.outputs.sqlDatabaseName }}
+          API_APP_NAME: ${{ steps.infra.outputs.apiAppName }}
+          API_IDENTITY_CLIENT_ID: ${{ steps.infra.outputs.apiIdentityClientId }}
+        run: |
+          set -euo pipefail
+
+          RUNNER_IP="$(curl -sS https://api.ipify.org)"
+          RULE_NAME="gh-actions-${GITHUB_RUN_ID}"
+
+          cleanup() {
+            az sql server firewall-rule delete \
+              --resource-group "$RESOURCE_GROUP" \
+              --server "$SQL_SERVER" \
+              --name "$RULE_NAME" \
+              --only-show-errors || true
+          }
+          trap cleanup EXIT
+
+          az sql server firewall-rule create \
+            --resource-group "$RESOURCE_GROUP" \
+            --server "$SQL_SERVER" \
+            --name "$RULE_NAME" \
+            --start-ip-address "$RUNNER_IP" \
+            --end-ip-address "$RUNNER_IP" \
+            --only-show-errors
+
+          mkdir -p "$HOME/bin"
+          curl -sSL https://github.com/microsoft/go-sqlcmd/releases/download/v1.10.0/sqlcmd-linux-amd64.tar.bz2 \
+            | tar -xj -C "$HOME/bin" sqlcmd
+          chmod +x "$HOME/bin/sqlcmd"
+
+          # CREATE USER ... FROM EXTERNAL PROVIDER needs the SQL server to hold its own
+          # identity with Directory Reader rights. Creating the user from the identity's
+          # client ID instead keeps the whole grant inside the data plane.
+          cat > grant-sql-access.sql <<SQL
+          SET NOCOUNT ON;
+          DECLARE @userName sysname = N'${API_APP_NAME}';
+          DECLARE @clientId uniqueidentifier = '${API_IDENTITY_CLIENT_ID}';
+          DECLARE @sid varchar(100) = CONVERT(varchar(100), CONVERT(varbinary(16), @clientId), 1);
+          DECLARE @cmd nvarchar(max);
+
+          IF NOT EXISTS (SELECT 1 FROM sys.database_principals WHERE name = @userName)
+          BEGIN
+              SET @cmd = N'CREATE USER ' + QUOTENAME(@userName) + N' WITH SID = ' + @sid + N', TYPE = E;';
+              EXEC sp_executesql @cmd;
+          END
+
+          ALTER ROLE db_datareader ADD MEMBER [${API_APP_NAME}];
+          ALTER ROLE db_datawriter ADD MEMBER [${API_APP_NAME}];
+          ALTER ROLE db_ddladmin ADD MEMBER [${API_APP_NAME}];
+          SQL
+
+          "$HOME/bin/sqlcmd" \
+            --authentication-method ActiveDirectoryAzCli \
+            -S "${SQL_SERVER}.database.windows.net" \
+            -d "$SQL_DATABASE" \
+            -b \
+            -i grant-sql-access.sql
+
+      - name: Publish API
+        run: dotnet publish src/api/TodoApi.csproj -c Release -o ./publish
+
+      - name: Deploy API to App Service
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ steps.infra.outputs.apiAppName }}
+          package: ./publish
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Build Frontend
+        run: cd src/frontend && npm ci && npm run build
+
+      - name: Get SWA deployment token
+        id: swa-token
+        run: |
+          TOKEN=$(az staticwebapp secrets list \
+            --name "${{ steps.infra.outputs.staticWebAppName }}" \
+            --resource-group "${{ secrets.AZURE_RG }}" \
+            --query "properties.apiKey" -o tsv)
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy Frontend to Static Web App
+        uses: Azure/static-web-apps-deploy@v1
+        with:
+          azure_static_web_apps_api_token: ${{ steps.swa-token.outputs.token }}
+          action: upload
+          app_location: src/frontend/dist
+          output_location: ""
+
+      # Post-deployment guard: proves the deployed API is only reachable through
+      # the Static Web App's authentication front door, and that a caller cannot
+      # impersonate a user by forging the identity header themselves.
+      - name: Verify API authentication boundary
+        env:
+          API_URL: ${{ steps.infra.outputs.apiAppUrl }}
+          API_APP_NAME: ${{ steps.infra.outputs.apiAppName }}
+          RESOURCE_GROUP: ${{ secrets.AZURE_RG }}
+        run: |
+          set -euo pipefail
+
+          # 1. Read the App Service Easy Auth configuration: is auth turned on,
+          #    is authentication required for every request, and is the linked
+          #    Static Web Apps identity provider enabled?
+          SUB=$(az account show --query id -o tsv)
+          read -r enabled required swa_enabled <<< "$(az resource show \
+            --ids "/subscriptions/${SUB}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.Web/sites/${API_APP_NAME}/config/authsettingsV2" \
+            --api-version 2023-12-01 \
+            --query '[properties.platform.enabled, properties.globalValidation.requireAuthentication, properties.identityProviders.azureStaticWebApps.enabled]' \
+            --output tsv | paste -s -)"
+
+          # All three flags must be true; anything else means the API could be
+          # served without the Static Web Apps authentication provider.
+          if [[ "$enabled $required $swa_enabled" != "true true true" ]]; then
+            echo "::error::The API must require the linked Static Web Apps authentication provider."
+            exit 1
+          fi
+
+          # 2. Simulate an attacker calling the API directly (bypassing the SWA
+          #    front door) with a hand-crafted client principal header.
+          principal=$(printf '{"userId":"spoofed-user"}' | base64 -w0)
+          status=$(curl --silent --show-error --output /dev/null --write-out '%{http_code}' \
+            --header "x-ms-client-principal: ${principal}" \
+            "$API_URL/api/todo")
+
+          # The platform must reject the forged identity. Any other status code
+          # (including a 2xx) means the spoofed header was accepted.
+          if [[ ! "$status" =~ ^(400|401|403)$ ]]; then
+            echo "::error::Direct API request with a forged identity returned HTTP ${status:-000}."
+            exit 1
+          fi
