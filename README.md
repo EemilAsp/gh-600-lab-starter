@@ -11,11 +11,29 @@ Open the instructions repository first and use this repository whenever the manu
 
 ## What's included
 
-- A React and Vite frontend for the sample todo application
-- An ASP.NET Core 8 Web API with Entity Framework Core
-- Unit and Playwright end-to-end tests
-- Bicep templates for provisioning the Azure environment
-- Configuration for Azure Static Web Apps, App Service, managed identity, and Azure SQL Database
+The [`gh-600-lab-starter`](https://github.com/sameeraman/gh-600-lab-starter) repository provides:
+
+- A React and Vite frontend for the sample Todo application.
+- An ASP.NET Core 8 Web API with Entity Framework Core.
+- Unit tests and Playwright end-to-end tests.
+- Bicep templates for provisioning the Azure environment.
+- Configuration for Azure Static Web Apps, App Service, managed identity, and Azure SQL Database.
+- A conventional GitHub Actions pipeline with the GH-500 security baseline.
+
+## What you will do in the lab
+
+Using the guides in the [`gh-600-lab-instructions`](https://github.com/sameeraman/gh-600-lab-instructions) repository, you will:
+
+- Deploy the sample application to Azure using OIDC federation and managed identity.
+- Create repository-wide and path-specific instructions that give agents durable context.
+- Build specialized custom agents with deliberately limited tool permissions.
+- Configure MCP servers and a cloud-agent environment.
+- Analyze agent memory and session state, then diagnose and tune agent failures.
+- Run unit and Playwright end-to-end tests as evidence in an agentic CI/CD pipeline.
+- Orchestrate parallel agent reviews and consolidate their reports through workflow artifacts.
+- Add preventive policy hooks, audit trails, and least-privilege controls.
+- Gate production deployment on human approval, then run smoke tests and an agent audit.
+- Test your GH-600 knowledge with exam-style questions and a final reference guide.
 
 ## Repository structure
 
