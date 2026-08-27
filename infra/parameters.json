@@ -4,6 +4,6 @@
   "parameters": {
     "environment":      { "value": "dev" },
     "location":         { "value": "westeurope" },
-    "sqlLocation":      { "value": "northeurope" }
+    "sqlLocation":      { "value": "swedencentral" }
   }
 }
