@@ -3,7 +3,7 @@
   "contentVersion": "1.0.0.0",
   "parameters": {
     "environment":      { "value": "dev" },
-    "location":         { "value": "northeurope" },
+    "location":         { "value": "westeurope" },
     "sqlLocation":      { "value": "northeurope" }
   }
 }
