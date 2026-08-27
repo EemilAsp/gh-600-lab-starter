@@ -1,9 +1,5 @@
-# ============================================================
-# Basic CI Pipeline (Starting Point)
-# This is a traditional CI pipeline WITHOUT agentic features.
-# Your exercise: Transform this into an agentic CI pipeline.
-# ============================================================
-name: Basic CI
+
+name: CI
 
 on:
   pull_request:
@@ -11,8 +7,11 @@ on:
   push:
     branches: [main]
 
-permissions:
-  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+permissions: {}
 
 jobs:
   build-and-test:
@@ -42,8 +41,54 @@ jobs:
 
       - name: Run Frontend Tests
         run: cd src/frontend && npm test
+      
+      - name: Upload Test Results
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: test-results
+          path: |
+            test-results/
+            src/frontend/coverage/
+          retention-days: 7
+  
 
+  agent-review:
+    needs: [build-and-test]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      copilot-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: [reviewer, security-scanner]
+    steps:
+      - uses: actions/checkout@v6
 
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Install Copilot CLI
+        run: npm install -g @github/copilot
+
+      - name: Run ${{ matrix.agent }} Agent
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          copilot --agent=${{ matrix.agent }} \
+            -p "Analyze the changes in this PR. Focus on your specialization area. Report findings with severity and file paths." \
+            --no-ask-user > "${{ matrix.agent }}-report.md"
+
+      - name: Upload Agent Report
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ matrix.agent }}-report
+          path: ${{ matrix.agent }}-report.md
+          retention-days: 7
+          if-no-files-found: error
   # ---- Security Scanning  ----
   #
   # This runs on every pull request AND on every push to main, so nothing
@@ -133,7 +178,83 @@ jobs:
         if: steps.dependency-review-support.outputs.supported != 'true'
         run: echo "Skipping dependency review because this is a private repository without GitHub Code Security."
 
+  consolidate:
+    needs: [dependency-review, agent-review, security-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      copilot-requests: write
+    steps:
+      - name: Download All Reports
+        uses: actions/download-artifact@v8
+        with:
+          path: reports/
 
+      - name: Normalize Reports Directory Permissions
+        run: |
+          mkdir -p reports
+          chmod -R u+rwX reports
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          package-manager-cache: false
+
+      - name: Install Copilot CLI
+        run: npm install -g @github/copilot
+
+      - name: AI-Consolidated Summary
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          copilot -p "Read the report files already present under ./reports/ and return only a concise Markdown executive summary for the pull request comment. Begin directly with a level-two heading. Do not wrap the response in a Markdown code fence. Do not create files or run shell commands. Include: overall risk level, blocking issues, advisory items, and a merge recommendation." \
+            --allow-tool='read,search' \
+            --silent \
+            --stream=off \
+            --no-ask-user > reports/executive-summary.md
+
+      - name: Upload Consolidated Summary
+        uses: actions/upload-artifact@v7
+        with:
+          name: executive-summary
+          path: reports/executive-summary.md
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Write Step Summary
+        run: |
+          {
+            echo "## 🤖 Agentic CI Consolidated Report"
+            echo ""
+            cat reports/executive-summary.md
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  publish-summary:
+    needs: [consolidate]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Download Consolidated Summary
+        uses: actions/download-artifact@v8
+        with:
+          name: executive-summary
+          path: reports/
+
+      - name: Post Summary to PR
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const fs = require('fs');
+            const summary = fs.readFileSync('reports/executive-summary.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: `## 🤖 Agentic CI Summary\n\n${summary}`
+            });
 
 
  # ---- Deploy ----
@@ -141,7 +262,7 @@ jobs:
   # required-reviewer rule, so this job waits for a human before it touches
   # Azure. See lab-preparation.md.
   deploy:
-    needs: [build-and-test, security-scan, dependency-review]
+    needs: [build-and-test, security-scan, dependency-review, consolidate]
     if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     permissions:
@@ -325,3 +446,5 @@ jobs:
             echo "::error::Direct API request with a forged identity returned HTTP ${status:-000}."
             exit 1
           fi
+
+        
